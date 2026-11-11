@@ -7,15 +7,29 @@ To compile all SkipDisk utilities after configuring:
 cmake --build /tmp/sdreviewicde-build --parallel 2
 ```
 
-For the io_uring backend, build the bundled library in a writable copy outside
-the source package, then point CMake to its headers and library:
+For the io_uring backend, install your distribution's `liburing-dev` package
+(for example, `sudo apt-get install liburing-dev` on Ubuntu), then configure:
+
+```bash
+cmake -S SkipDisk -B /tmp/sdreviewicde-uring-build -DUSE_AIO=OFF \
+  -DCMAKE_BUILD_TYPE=Release -DBLA_VENDOR=OpenBLAS
+cmake --build /tmp/sdreviewicde-uring-build --parallel 2
+```
+
+CMake uses the installed headers and library. It does not automatically include
+the bundled headers: mixing these with an older system library/Linux UAPI can
+fail with `BLOCK_URING_CMD_DISCARD` undeclared. Use a fresh build directory when
+changing the dependency. AIO builds do not require liburing.
+
+To use a separately built copy instead, explicitly select both its headers and
+library:
 
 ```bash
 cp -a SkipDisk/third_party/liburing /tmp/sdreviewicde-liburing
 (cd /tmp/sdreviewicde-liburing && ./configure && make -C src -j2)
 cmake -S SkipDisk -B /tmp/sdreviewicde-uring-build -DUSE_AIO=OFF \
-  -DCMAKE_CXX_FLAGS=-I/tmp/sdreviewicde-liburing/src/include \
-  -DCMAKE_EXE_LINKER_FLAGS=-L/tmp/sdreviewicde-liburing/src
+  -DLIBURING_INCLUDE_DIR=/tmp/sdreviewicde-liburing/src/include \
+  -DLIBURING_LIBRARY=/tmp/sdreviewicde-liburing/src/liburing.a
 cmake --build /tmp/sdreviewicde-uring-build --parallel 2
 ```
 

@@ -43,19 +43,22 @@ add_definitions(
 	-DOVERLAP_INIT
 )
 
-include_directories(
-	${PROJECT_SOURCE_DIR}/third_party/liburing/src/include
-)
-link_directories(
-	${PROJECT_SOURCE_DIR}/third_party/liburing/src
-)
 if(USE_AIO)
 	message(STATUS "Using AIO for asynchronous I/O, compatible but slower.")
 	link_libraries(aio)
 	add_definitions(-DUSE_AIO)
 else()
 	message(STATUS "Using liburing for asynchronous I/O, faster but requires kernel support.")
-	link_libraries(uring)
+	# Select headers and library from an installed liburing, not the unconfigured
+	# bundled headers (which may require a different Linux UAPI version).
+	find_path(LIBURING_INCLUDE_DIR NAMES liburing.h)
+	find_library(LIBURING_LIBRARY NAMES uring)
+	if(NOT LIBURING_INCLUDE_DIR OR NOT LIBURING_LIBRARY)
+		message(FATAL_ERROR "io_uring requires liburing-dev. Install it or set LIBURING_INCLUDE_DIR and LIBURING_LIBRARY to a matching built liburing; alternatively use -DUSE_AIO=ON.")
+	endif()
+	message(STATUS "liburing headers: ${LIBURING_INCLUDE_DIR}; library: ${LIBURING_LIBRARY}")
+	include_directories(${LIBURING_INCLUDE_DIR})
+	link_libraries(${LIBURING_LIBRARY})
 endif()
 
 # Use tcmalloc, as jemalloc does not support python (static TLS block).

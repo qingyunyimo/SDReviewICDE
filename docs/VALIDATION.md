@@ -16,6 +16,15 @@ Completed checks:
 - Source package scanned for binary payloads, common credential patterns,
   private storage-bucket names, and local workstation paths.
 
+The io_uring dependency-selection fix was also validated locally with the
+Ubuntu 24.04 `liburing-dev` and `liburing2` 2.5-1build1 packages unpacked into an
+isolated directory. Both executables compiled and linked, and all three smoke
+tests passed with that library explicitly selected at runtime. The host was
+Ubuntu 26.04 with GCC 15.2; this is not a full Ubuntu 24.04 environment test.
+Configuration without liburing development headers produced the intended
+dependency error; AIO configuration still succeeded without those headers.
+
 No paper benchmark was rerun, and no benchmark measurements or generated test
-inputs are included. The optional io_uring build instructions were not executed
-as part of this package validation.
+inputs are included. BigCode validation remains incomplete: the earlier cloud
+attempt stopped during compilation before any search, and the fixed version
+has not yet been rerun on that dataset.
