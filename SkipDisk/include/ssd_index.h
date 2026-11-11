@@ -1,0 +1,922 @@
+#pragma once
+#include <immintrin.h>
+#include <cassert>
+#include <cstdint>
+#include <string>
+#include <set>
+#include "nbr/abstract_nbr.h"
+#include <omp.h>
+
+#include "aligned_file_reader.h"
+#include "utils/concurrent_queue.h"
+#include "utils/lock_table.h"
+#include "utils/percentile_stats.h"
+#include "nbr/pq_nbr.h"
+#include "utils.h"
+#include "neighbor.h"
+#include "index.h"
+#include "bitpreserver.h"
+#include "mixed_pivot.h"
+#include <unordered_map>
+
+#define MAX_N_CMPS 16384
+#define MAX_N_EDGES 1024
+
+constexpr int kIndexSizeFactor = 2;
+
+enum SearchMode {
+  BEAM_SEARCH = 0,
+  PAGE_SEARCH = 1,
+  PIPE_SEARCH = 2,
+  CORO_SEARCH = 3,
+  SKIPDISK_SEARCH = 4,
+  PQ_MEMORY_SEARCH = 5,
+  EXACT_MEMORY_SEARCH = 6,
+  PCA_MEMORY_SEARCH = 7,
+  PCA_PQ_MEMORY_SEARCH = 8
+};
+
+namespace pipeann {
+  template<typename T, typename TagT = uint32_t>
+  class SSDIndex {
+   public:
+    SSDIndex(pipeann::Metric m, std::shared_ptr<AlignedFileReader> &fileReader,
+             AbstractNeighbor<T> *nbr = new PQNeighbor<T>(), bool tags = false, Parameters *parameters = nullptr);
+
+    ~SSDIndex();
+
+    // returns region of `node_buf` containing [COORD(T)]
+    inline T *offset_to_node_coords(const char *node_buf) {
+      return (T *) node_buf;
+    }
+
+    // returns region of `node_buf` containing [NNBRS][NBR_ID(uint32_t)]
+    inline unsigned *offset_to_node_nhood(const char *node_buf) {
+      return (unsigned *) (node_buf + data_dim * sizeof(T));
+    }
+
+    // obtains region of sector containing node
+    inline char *offset_to_node(const char *sector_buf, uint32_t node_id) {
+      return offset_to_loc(sector_buf, id2loc(node_id));
+    }
+
+    // sector # on disk where node_id is present
+    inline uint64_t node_sector_no(uint32_t node_id) {
+      return loc_sector_no(id2loc(node_id));
+    }
+
+    inline uint64_t u_node_offset(uint32_t node_id) {
+      return u_loc_offset(id2loc(node_id));
+    }
+
+    // unaligned offset to location
+    inline uint64_t u_loc_offset(uint64_t loc) {
+      return loc * max_node_len;  // compacted store.
+    }
+
+    inline uint64_t u_loc_offset_nbr(uint64_t loc) {
+      return loc * max_node_len + data_dim * sizeof(T);
+    }
+
+    inline char *offset_to_loc(const char *sector_buf, uint64_t loc) {
+      return (char *) sector_buf + (nnodes_per_sector == 0 ? 0 : (loc % nnodes_per_sector) * max_node_len);
+    }
+
+    // avoid integer overflow when * SECTOR_LEN.
+    inline uint64_t loc_sector_no(uint64_t loc) {
+      return 1 + (nnodes_per_sector > 0 ? loc / nnodes_per_sector : loc * DIV_ROUND_UP(max_node_len, SECTOR_LEN));
+    }
+
+    inline uint64_t sector_to_loc(uint64_t sector_no, uint32_t sector_off) {
+      return nnodes_per_sector == 0 ? (sector_no - 1) / DIV_ROUND_UP(max_node_len, SECTOR_LEN)  // sector_off == 0.
+                                    : (sector_no - 1) * nnodes_per_sector + sector_off;
+    }
+
+    char* navi_graph_ = nullptr;
+    uint64_t navi_node_len_ = 0;
+    u_int64_t navi_dim_ = 0; 
+    uint64_t navi_data_len_ = 0;
+    int high_significant_bits_ = 0;
+    BitPreserver bit_preserver_{256, 16}; // default 256 dimensions, 16 bits per dimension
+    char* pcabit_cache_ = nullptr;
+    std::unique_ptr<MixedPivotCodec> mixed_pivot_;
+    bool mixed_subpq_navigation_ = false;
+    // Optional unquantized PCA-prefix pivot for controlled filtering ablations.
+    std::vector<float> fp32_filter_data_;
+    uint32_t fp32_filter_dim_ = 0;
+    void load_fp32_filter(const std::string &path, uint32_t dim);
+    // Static per-point filtering cache; adjacency and subPQ navigation cover all IDs.
+    bool mixed_cache_ = false;
+    std::string mixed_cache_ids_;
+    uint64_t mixed_cache_count_ = 0;
+    std::vector<uint32_t> mixed_cache_slots_;
+    std::vector<char> mixed_cache_data_;
+    char *mixed_filter_buf(uint32_t id) {
+      if (!mixed_pivot_ || !mixed_cache_) return get_navi_buf(id);
+      const uint32_t slot = mixed_cache_slots_[id];
+      return slot == UINT32_MAX ? nullptr : mixed_cache_data_.data() + size_t(slot) * (navi_data_len_ + 4);
+    }
+    char *mixed_neighbors_buf(uint32_t id) {
+      return get_navi_buf(id) + ((mixed_pivot_ && mixed_cache_) ? 0 : navi_data_len_ + 4);
+    }
+    // Configure before launching query workers; disabled by default.
+    bool mixed_estimation_ = false;
+    double mixed_estimation_ratio_ = 1.0;
+    void load_mixed_estimation(const std::string &eigenvalues, const std::string &epsilon_file);
+    std::unordered_map<uint32_t, std::pair<bool, char*>> graph_cache_map_udm_;
+    inline char* get_navi_buf(uint32_t node_id){
+     return navi_graph_ + node_id * navi_node_len_; 
+    }
+
+    std::vector<std::vector<uint32_t>> navi_graph_nodes_;
+    void load_navi_graph(const std::string &index_prefix);
+    float* landmarks_dist_ = nullptr;
+    float global_gamma_ = 0.6f;
+    void load_landmarks_dist(const char *index_prefix);
+    void set_global_gamma(float gamma){
+      global_gamma_ = gamma;
+    }
+    inline float l2_sqr( const float* __restrict__ vec0, const float* __restrict__ vec1, size_t dim) {
+        float result = 0;
+        size_t mul16 = dim - (dim & 0b1111);
+        auto sum = _mm512_setzero_ps();
+        size_t i = 0;
+        for (; i < mul16; i += 16) {
+            auto xxx = _mm512_loadu_ps(&vec0[i]);
+            auto yyy = _mm512_loadu_ps(&vec1[i]);
+            auto ttt = _mm512_sub_ps(xxx, yyy);
+            sum = _mm512_fmadd_ps(ttt, ttt, sum);
+        }
+        result = _mm512_reduce_add_ps(sum);
+        for (; i < dim; ++i) {
+            float tmp = vec0[i] - vec1[i];
+            result += tmp * tmp;
+        }
+
+        return result;
+    }
+
+    std::vector<float> eps;
+    float epsilon1 = 0.5f; //default 2.1
+    void init_ad_paras(int D){
+      //eps.resize(D);
+      for(int i = 0; i < D; i++){
+          eps.push_back(1.0 * i / D * (1.0 + epsilon1 / std::sqrt(i)) * (1.0 + epsilon1 / std::sqrt(i)));
+          //std::cout<<eps[i]<<","<<epsilon1<<";";
+      }
+    }
+    float ratio(const int &D, const int &i){
+      if(i == D)return 1.0;
+      //return 1.0 * i / D * (1.0 + epsilon1 / std::sqrt(i)) * (1.0 + epsilon1 / std::sqrt(i));
+      return eps[i];
+    }
+
+    std::vector<float> lmds;
+    std::vector<float> cdf_lmd;
+    std::vector<float> epsilon;
+
+    void load_dade(const char *index_directory, std::string epsilon_val){
+      std::string lmds_file_path = std::string(index_directory) + "LMD.fvecs";
+      std::ifstream lmds_file(lmds_file_path, std::ios::binary);
+      if(!lmds_file){
+        std::cerr << "LMD file not exist!" << std::endl;
+        exit(-1);
+      }
+      int lmds_dim = 0;
+      lmds_file.read((char*)&lmds_dim, sizeof(int));
+      lmds.resize(lmds_dim);
+      lmds_file.read((char*)lmds.data(), lmds_dim * sizeof(float));
+      lmds_file.close();
+      std::cout<<"LMDs loaded, dim: "<<lmds_dim<<std::endl;
+      std::string eps_file_path = std::string(index_directory) + "E/" + epsilon_val + ".fvecs";
+      std::ifstream eps_file(eps_file_path, std::ios::binary);
+      if(!eps_file){
+        std::cerr << "Epsilon file not exist!" << std::endl;
+        exit(-1);
+      }
+      int eps_dim = 0;
+      eps_file.read((char*)&eps_dim, sizeof(int));
+      epsilon.resize(eps_dim);
+      eps_file.read((char*)epsilon.data(), eps_dim * sizeof(float));
+      eps_file.close();
+    }
+
+    void compute_cdf_lmd(int D){
+      float sum = 0;
+      cdf_lmd.push_back(sum);
+      for(int i = 0; i < D; ++i){
+          sum += lmds[i];
+          cdf_lmd.push_back(sum);
+      }
+    }
+
+    float pcaratio(const int &D, const int &i){
+      if(i == D)return 1.0;
+      //std::cout<<epsilon[i]<<","<<cdf_lmd[i]<<","<<cdf_lmd[D]<<";";
+      //std::cout<<"e: "<<cdf_lmd[i] / cdf_lmd[D] * (1.0 + epsilon[i]) * (1.0 + epsilon[i])<<",";
+      return cdf_lmd[i] / cdf_lmd[D] * (1.0 + epsilon[i]) * (1.0 + epsilon[i]);
+      //return cdf_lmd[i] / cdf_lmd[D] * (1.0 + epsilon[i]);
+    }
+    
+    float pcaratio1(const int &D, const int &i){
+      return cdf_lmd[i] / cdf_lmd[D] * (1.0 + epsilon[i]);
+    }
+    std::vector<uint32_t> reverse_neighbors_;
+    void outneighbor();
+
+  
+    // Original vectors used by the in-memory search modes.
+    T *base_vecs_ = nullptr;
+    size_t base_vecs_num_ = 0;
+    size_t base_vecs_dim_ = 0;
+
+    std::vector<std::pair<uint32_t, uint32_t>> ivf_mapping_; //nlist id and offset in the list file
+   
+
+    void init_metadata(const SSDIndexMetadata<T> &meta) {
+      meta.print();
+      this->cur_id = this->num_points = this->init_num_pts = meta.npoints;
+      this->data_dim = meta.data_dim;
+      this->aligned_dim = ROUND_UP(this->data_dim, 8);
+      this->range = meta.range;
+      this->max_node_len = meta.max_node_len;
+      this->nnodes_per_sector = meta.nnodes_per_sector;  // this makes reading to zero offset correct.
+      this->size_per_io = SECTOR_LEN * (nnodes_per_sector > 0 ? 1 : DIV_ROUND_UP(max_node_len, SECTOR_LEN));
+      LOG(INFO) << "Size per IO: " << size_per_io;
+
+      this->cur_loc = num_points;
+      // aligned.
+      //if (num_points % nnodes_per_sector != 0) {
+      //  cur_loc += nnodes_per_sector - (num_points % nnodes_per_sector);
+      //}
+      LOG(INFO) << "Cur location: " << this->cur_loc;
+
+      // update-related metadata, if not initialized in params, initialize here.
+      if (l_index < meta.range) {
+        // experience values.
+        LOG(INFO) << "Automatically set the update-related parameters.";
+        this->l_index = meta.range + 32;
+        this->beam_width = 4;
+        this->maxc = 384;
+        this->alpha = 1.2;
+        LOG(INFO) << "L_index: " << this->l_index << " beam_width: " << this->beam_width << " maxc: " << this->maxc
+                  << " alpha: " << this->alpha;
+      }
+      medoid = meta.entry_point;
+    }
+
+    void init_query_buf(QueryBuffer<T> &buf) {
+      pipeann::alloc_aligned((void **) &buf.coord_scratch, this->aligned_dim * sizeof(T), 8 * sizeof(T));
+      pipeann::alloc_aligned((void **) &buf.sector_scratch, MAX_N_SECTOR_READS * size_per_io, SECTOR_LEN);
+      pipeann::alloc_aligned((void **) &buf.nbr_vec_scratch,
+                             MAX_N_EDGES * AbstractNeighbor<T>::MAX_BYTES_PER_NBR * sizeof(uint8_t), 256);
+      pipeann::alloc_aligned((void **) &buf.nbr_ctx_scratch,
+                             256 * AbstractNeighbor<T>::MAX_BYTES_PER_NBR * sizeof(float), 256);
+      pipeann::alloc_aligned((void **) &buf.aligned_dist_scratch, MAX_N_EDGES * sizeof(float), 256);
+      pipeann::alloc_aligned((void **) &buf.aligned_query_T, this->aligned_dim * sizeof(T), 8 * sizeof(T));
+
+      buf.visited = new tsl::robin_set<uint64_t>(4096);
+      buf.page_visited = new tsl::robin_set<unsigned>(4096);
+
+      memset(buf.sector_scratch, 0, MAX_N_SECTOR_READS * SECTOR_LEN);
+      memset(buf.coord_scratch, 0, this->aligned_dim * sizeof(T));
+      memset(buf.aligned_query_T, 0, this->aligned_dim * sizeof(T));
+    }
+
+    QueryBuffer<T> *pop_query_buf(const T *query) {
+      QueryBuffer<T> *data = this->thread_data_queue.pop();
+      while (data == this->thread_data_queue.null_T) {
+        this->thread_data_queue.wait_for_push_notify();
+        data = this->thread_data_queue.pop();
+      }
+
+      if (likely(query != nullptr)) {
+        if (data_is_normalized) {
+          // Data has been normalized. Normalize search vector too.
+          float norm = pipeann::compute_l2_norm(query, this->data_dim);
+          for (uint32_t i = 0; i < this->data_dim; i++) {
+            data->aligned_query_T[i] = query[i] / norm;
+          }
+        } else {
+          memcpy(data->aligned_query_T, query, this->data_dim * sizeof(T));
+        }
+      }
+      return data;
+    }
+
+    void push_query_buf(QueryBuffer<T> *data) {
+      this->thread_data_queue.push(data);
+      this->thread_data_queue.push_notify_all();
+    }
+
+    // load compressed data, and obtains the handle to the disk-resident index
+    int load(const char *index_prefix, uint32_t num_threads, bool new_index_format = true,
+             bool use_page_search = false);
+
+    int load_pca_index(const char *index_prefix, uint32_t num_threads, bool new_index_format = true, 
+            bool use_page_search = false);
+    
+    int load_pca_subpq_index(const char *index_prefix, uint32_t num_threads, bool new_index_format = true, 
+            bool use_page_search = false);
+
+    int load_pca_bit_index(const char *index_prefix, uint32_t num_threads, bool new_index_format = true, 
+            bool use_page_search = false);
+
+    int load_pca_mixed_index(const char *index_prefix, uint32_t num_threads,
+                             const std::string &cache_ids = "", uint64_t cache_count = UINT64_MAX);
+    // subpq_prefix names *_navi_pq_{pivots,compressed}.bin in PCA prefix coordinates.
+    int load_pca_mixed_subpq_index(const char *index_prefix, const char *subpq_prefix,
+                                  uint32_t num_threads, const std::string &cache_ids = "",
+                                  uint64_t cache_count = UINT64_MAX);
+    void load_pca_mixed_navi_graph(const std::string &path);
+    int load_pca_pivot_index(const char *index_prefix, uint32_t num_threads,
+                             bool use_page_search, bool mixed);
+
+    int load_pca_bit_pq_index(const char *index_prefix, uint32_t num_threads, bool new_index_format = true, 
+            bool use_page_search = false);
+    
+    int load_pca_bit_subpq_index(const char *index_prefix, uint32_t num_threads, bool new_index_format = true, 
+            bool use_page_search = false);
+    int load_pca_bit_subpq_index(const char *index_prefix, uint32_t num_threads, std::string sub_dim, bool new_index_format = true, 
+            bool use_page_search = false);
+    int load_pca_bit_subpq_cache_index(const char *index_prefix, uint32_t num_threads, bool new_index_format = true, 
+            bool use_page_search = false);
+    int load_trim_index(const char *index_prefix, uint32_t num_threads, bool new_index_format = true, 
+            bool use_page_search = false);
+    
+    int load_trim_index_navi(const char *index_prefix, uint32_t num_threads, bool new_index_format = true, 
+            bool use_page_search = false);
+
+    void load_pca_navi_graph(const std::string &navi_graph_path);
+    
+    void load_pca_bit_navi_graph(const std::string &navi_bit_graph_path);
+
+    void load_pcabit_cache(const char *index_prefix, size_t num_nodes_to_cache);
+
+    void load_mem_index(Metric metric, const size_t query_dim, const std::string &mem_index_path);
+
+    // Loads a standard DiskANN .bin file ([npts, dim, vectors]) into memory.
+    // Returns non-zero when its shape does not match the loaded index.
+    int load_base_vectors(const std::string &base_vectors_path);
+
+    // This function loads id2loc and loc2id (i.e., page_layout), to support index reordering.
+    void load_page_layout(const std::string &index_prefix, const uint64_t nnodes_per_sector = 0,
+                          const uint64_t num_points = 0);
+
+    void load_tags(const std::string &tag_file, size_t offset = 0);
+
+    uint64_t return_nd();
+
+    // search supporting update.
+    size_t beam_search(const T *query, const uint64_t k_search, const uint32_t mem_L, const uint64_t l_search,
+                       TagT *res_tags, float *res_dists, const uint64_t beam_width, QueryStats *stats = nullptr,
+                       tsl::robin_set<uint32_t> *deleted_nodes = nullptr, bool dyn_search_l = true);
+
+    size_t coro_search(T **queries, const uint64_t k_search, const uint32_t mem_L, const uint64_t l_search,
+                       TagT **res_tags, float **res_dists, const uint64_t beam_width, int N);
+
+    // read-only search algorithms.
+    size_t page_search(const T *query, const uint64_t k_search, const uint32_t mem_L, const uint64_t l_search,
+                       TagT *res_tags, float *res_dists, const uint64_t beam_width, QueryStats *stats = nullptr);
+
+    size_t pipe_search(const T *query, const uint64_t k_search, const uint32_t mem_L, const uint64_t l_search,
+                       TagT *res_tags, float *res_dists, const uint64_t beam_width, QueryStats *stats = nullptr);
+
+    size_t skipdisk_pca_search(const T *query, const uint64_t k_search, const uint64_t l_search,
+                       TagT *res_tags, float *res_dists, const uint64_t beam_width, QueryStats *stats = nullptr);
+    size_t skipdisk_pcabit_search(const T *query, const uint64_t k_search, const uint64_t l_search,
+                       TagT *res_tags, float *res_dists, const uint64_t beam_width, QueryStats *stats = nullptr,
+                       bool in_memory = false, bool quantized_only = false, bool use_bound = true,
+                       const T *navigation_query = nullptr);
+    // Query and filtering pivots use the SSD vectors' coordinates. Optional
+    // navigation_query is already transformed into the independent subPQ space.
+    size_t skipdisk_pcamixed_search(const T *query, uint64_t k_search, uint64_t l_search,
+                                   TagT *res_tags, float *distances, uint64_t beam_width,
+                                   QueryStats *stats = nullptr, bool in_memory = false, bool quantized_only = false,
+                                   bool use_bound = true, const T *navigation_query = nullptr);
+    // Collect expanded (pre-bound-pruning) candidates; return navigation-space
+    // squared distances, without reading or reranking full-precision vectors.
+    size_t skipdisk_pcamixed_quantized_search(const T *query, uint64_t k_search, uint64_t l_search,
+                                             TagT *res_tags, float *distances, QueryStats *stats = nullptr) {
+      return skipdisk_pcamixed_search(query, k_search, l_search, res_tags, distances, 1, stats, false, true);
+    }
+    // Full-precision base vectors must be loaded in the same PCA coordinates.
+    size_t skipdisk_pcamixed_memory_search(const T *query, uint64_t k_search, uint64_t l_search,
+                                          TagT *res_tags, float *distances, QueryStats *stats = nullptr,
+                                          bool use_bound = true) {
+      return skipdisk_pcamixed_search(query, k_search, l_search, res_tags, distances, 1, stats, true, false, use_bound);
+    }
+    size_t skipdisk_pcabitpq_search(const T* query0, const T *query1, const uint64_t k_search, const uint64_t l_search,
+                       TagT *res_tags, float *res_dists, const uint64_t beam_width, QueryStats *stats = nullptr);
+    size_t pq_memory_search(const T *query, const uint64_t k_search, const uint64_t l_search,
+                       TagT *res_tags, float *res_dists, QueryStats *stats = nullptr);
+    size_t exact_memory_search(const T *query, const uint64_t k_search, const uint64_t l_search,
+                       TagT *res_tags, float *res_dists, QueryStats *stats = nullptr);
+    size_t pca_memory_search(const T *query, const float *pca_query, const uint64_t pca_dim,
+                       const uint64_t k_search, const uint64_t l_search, TagT *res_tags, float *res_dists,
+                       QueryStats *stats = nullptr);
+    size_t pca_pq_memory_search(const T *query, const float *pca_query, const uint64_t pca_dim,
+                       const uint64_t k_search, const uint64_t l_search, TagT *res_tags, float *res_dists,
+                       QueryStats *stats = nullptr);
+    size_t skipdisk_pcabitsubpq_search(const T* query, const uint64_t k_search, const uint64_t l_search,
+                       TagT *res_tags, float *res_dists, const uint64_t beam_width, QueryStats *stats = nullptr);
+    size_t skipdisk_pcabitsubpqest_search(const T* query, const uint64_t k_search, const uint64_t l_search,
+                       TagT *res_tags, float *res_dists, const uint64_t beam_width, QueryStats *stats = nullptr);
+    size_t skipdisk_pcabitsubpqadest_search(const T* query, const T* queryR, const uint64_t k_search, const uint64_t l_search,
+                       TagT *res_tags, float *res_dists, const uint64_t beam_width, QueryStats *stats = nullptr); 
+    size_t skipdisk_pcabitsubpq_cache_search(const T* query, const uint64_t k_search, const uint64_t l_search,
+                       TagT *res_tags, float *res_dists, const uint64_t beam_width, QueryStats *stats = nullptr);
+    size_t skipdisk_pcabitsubpqest_cache_search(const T* query, const uint64_t k_search, const uint64_t l_search,
+                       TagT *res_tags, float *res_dists, const uint64_t beam_width, QueryStats *stats = nullptr);
+    size_t skipdisk_pcasubpq_search(const T* query, const uint64_t k_search, const uint64_t l_search,
+                       TagT *res_tags, float *res_dists, const uint64_t beam_width, QueryStats *stats = nullptr); 
+    size_t lower_bound_analysis(const T *query, const char* dataset);
+    // deflates `vec` into PQ ids
+    std::vector<uint8_t> deflate_vector(const T *vec);
+
+    // index info
+    // nhood of node `i` is in sector: [i / nnodes_per_sector]
+    // offset in sector: [(i % nnodes_per_sector) * max_node_len]
+    // nnbrs of node `i`: *(unsigned*) (buf)
+    // nbrs of node `i`: ((unsigned*)buf) + 1
+    uint64_t max_node_len = 0, nnodes_per_sector = 0, max_degree = 0;
+
+   protected:
+    void init_buffers(uint64_t nthreads);
+    void destroy_buffers();
+
+   public:
+    // data info
+    uint64_t num_points = 0;
+    uint64_t init_num_pts = 0;
+    uint64_t data_dim = 0;
+    uint64_t aligned_dim = 0;
+    uint64_t size_per_io = 0;
+
+    std::string _disk_index_file;
+
+    std::shared_ptr<AlignedFileReader> &reader;
+
+    AbstractNeighbor<T> *nbr_handler;
+    AbstractNeighbor<T> *trim_nbr_handler;
+    
+    // distance comparator
+    std::shared_ptr<Distance<T>> dist_cmp;
+
+   public:
+    // in-place update.
+    int insert_in_place(const T *point, const TagT &tag, tsl::robin_set<uint32_t> *deletion_set = nullptr);
+    void do_beam_search(const T *vec, uint32_t mem_L, uint32_t Lsize, const uint32_t beam_width,
+                        std::vector<Neighbor> &expanded_nodes_info, tsl::robin_map<uint32_t, T *> *coord_map = nullptr,
+                        T *coord_buf = nullptr, QueryStats *stats = nullptr,
+                        tsl::robin_set<uint32_t> *exclude_nodes = nullptr, bool dyn_search_l = true,
+                        std::vector<uint64_t> *passthrough_page_ref = nullptr);
+    void occlude_list(std::vector<Neighbor> &pool, const tsl::robin_map<uint32_t, T *> &coord_map,
+                      std::vector<Neighbor> &result, std::vector<float> &occlude_factor);
+    void prune_neighbors(const tsl::robin_map<uint32_t, T *> &coord_map, std::vector<Neighbor> &pool,
+                         std::vector<uint32_t> &pruned_list);
+    void occlude_list_pq(std::vector<Neighbor> &pool, std::vector<Neighbor> &result, std::vector<float> &occlude_factor,
+                         uint8_t *scratch);
+    void prune_neighbors_pq(std::vector<Neighbor> &pool, std::vector<uint32_t> &pruned_list, uint8_t *scratch);
+
+    // delta pruning.
+    struct TriangleNeighbor {
+      unsigned id;
+      float tgt_dis;
+      float distance;
+
+      inline bool operator<(const TriangleNeighbor &other) const {
+        return (distance < other.distance) || (distance == other.distance && id < other.id);
+      }
+      inline bool operator==(const TriangleNeighbor &other) const {
+        return (id == other.id);
+      }
+    };
+    void delta_prune_neighbors_pq(std::vector<TriangleNeighbor> &pool, std::vector<uint32_t> &pruned_list,
+                                  uint8_t *scratch, int tgt_idx);
+    void reload(const char *index_prefix, uint32_t num_threads);
+    // background I/O commit.
+    struct BgTask {
+      QueryBuffer<T> *thread_data;
+      std::vector<IORequest> writes;
+      std::vector<uint64_t> pages_to_unlock;
+      std::vector<uint64_t> pages_to_deref;
+      bool terminate = false;
+    };
+    // its concurrency should not be the bottleneck.
+    ConcurrentQueue<BgTask *> bg_tasks = ConcurrentQueue<BgTask *>(nullptr);
+    void bg_io_thread();
+    static constexpr int kBgIOThreads = 1;
+    std::thread *bg_io_thread_[kBgIOThreads]{nullptr};
+
+    // test the estimation efficacy.
+    uint32_t beam_width, l_index, range, maxc;
+    float alpha;
+    // assumed max thread, only the first nthreads are initialized.
+    v2::SparseLockTable<uint64_t> page_lock_table, vec_lock_table, page_idx_lock_table, idx_lock_table;
+    std::shared_mutex merge_lock;  // serve search during merge.
+
+    // if ID == tag, then it is not stored.
+    libcuckoo::cuckoohash_map<uint32_t, TagT> tags;
+    TagT id2tag(uint32_t id) {
+#ifdef NO_MAPPING
+      return id;  // use ID to replace tags.
+#else
+      TagT ret;
+      if (tags.find(id, ret)) {
+        return ret;
+      } else {
+        return id;
+      }
+#endif
+    }
+
+    int get_vector_by_id(const uint32_t &id, T *vector);
+    static constexpr uint32_t kInvalidID = std::numeric_limits<uint32_t>::max();
+    static constexpr uint32_t kAllocatedID = std::numeric_limits<uint32_t>::max() - 1;
+
+    void lock_vec(v2::SparseLockTable<uint64_t> &lock_table, uint32_t target, const std::vector<uint32_t> &neighbors,
+                  bool rd = false) {
+      std::vector<uint32_t> to_lock;
+      to_lock.assign(neighbors.begin(), neighbors.end());
+      if (target != kInvalidID)
+        to_lock.push_back(target);
+      std::sort(to_lock.begin(), to_lock.end());
+      for (auto &id : to_lock) {
+        rd ? lock_table.rdlock(id) : lock_table.wrlock(id);
+      }
+    }
+
+    void unlock_vec(v2::SparseLockTable<uint64_t> &lock_table, uint32_t target,
+                    const std::vector<uint32_t> &neighbors) {
+      if (target != kInvalidID)
+        lock_table.unlock(target);
+      for (auto &id : neighbors) {
+        lock_table.unlock(id);
+      }
+    }
+
+   private:
+    std::vector<uint32_t> get_to_lock_idx(uint32_t target, const std::vector<uint32_t> &neighbors) {
+      std::vector<uint32_t> to_lock;
+      to_lock.assign(neighbors.begin(), neighbors.end());
+      if (target != kInvalidID) {
+        to_lock.push_back(target);
+      }
+      // sort and deduplicate
+      std::sort(to_lock.begin(), to_lock.end());
+      auto last = std::unique(to_lock.begin(), to_lock.end());
+      to_lock.erase(last, to_lock.end());
+      return to_lock;
+    }
+
+   public:
+    // lock the mapping for target/page if use_page_search == false/true.
+    std::vector<uint32_t> lock_idx(v2::SparseLockTable<uint64_t> &lock_table, uint32_t target,
+                                   const std::vector<uint32_t> &neighbors, bool rd = false) {
+#ifndef READ_ONLY_TESTS
+      std::vector<uint32_t> to_lock = get_to_lock_idx(target, neighbors);
+      for (auto &id : to_lock) {
+        rd ? lock_table.rdlock(id) : lock_table.wrlock(id);
+      }
+      return to_lock;
+#else
+      return std::vector<uint32_t>();
+#endif
+    }
+
+    void unlock_idx(v2::SparseLockTable<uint64_t> &lock_table, const std::vector<uint32_t> &to_lock) {
+#ifndef READ_ONLY_TESTS
+      for (auto &id : to_lock) {
+        lock_table.unlock(id);
+      }
+#endif
+    }
+
+    void unlock_idx(v2::SparseLockTable<uint64_t> &lock_table, const uint32_t &to_lock) {
+#ifndef READ_ONLY_TESTS
+      lock_table.unlock(to_lock);
+#endif
+    }
+
+    // two-level, as id2page may change before and after grabbing the lock.
+    std::vector<uint32_t> lock_page_idx(v2::SparseLockTable<uint64_t> &lock_table, uint32_t target,
+                                        const std::vector<uint32_t> &neighbors, bool rd = false) {
+#ifndef READ_ONLY_TESTS
+      if (!use_page_search_) {
+        return std::vector<uint32_t>();
+      }
+      std::vector<uint32_t> to_lock(neighbors.begin(), neighbors.end());
+      if (target != kInvalidID) {
+        to_lock.push_back(target);
+      }
+
+      for (size_t i = 0; i < to_lock.size(); ++i) {
+        to_lock[i] = id2page(to_lock[i]);
+      }
+
+      // sort and deduplicate
+      std::sort(to_lock.begin(), to_lock.end());
+      auto last = std::unique(to_lock.begin(), to_lock.end());
+      to_lock.erase(last, to_lock.end());
+
+      for (auto &id : to_lock) {
+        rd ? lock_table.rdlock(id) : lock_table.wrlock(id);
+      }
+      return to_lock;
+#else
+      return std::vector<uint32_t>();
+#endif
+    }
+
+    void unlock_page_idx(v2::SparseLockTable<uint64_t> &lock_table, const std::vector<uint32_t> &to_lock) {
+#ifndef READ_ONLY_TESTS
+      if (!use_page_search_) {
+        return;
+      }
+      for (auto &id : to_lock) {
+        lock_table.unlock(id);
+      }
+#endif
+    }
+
+    // in-memory navigation graph
+    std::unique_ptr<Index<T, uint32_t>> mem_index_;
+
+    // page search
+    bool use_page_search_ = true;
+
+    // Concurrency control is done in lock_idx.
+    // Only resize should be protected.
+    std::vector<uint32_t> id2loc_;
+    v2::ReaderOptSharedMutex id2loc_resize_mu_;
+
+    uint32_t id2loc(uint32_t id) {
+#ifdef NO_MAPPING
+      return id;
+#else
+      id2loc_resize_mu_.lock_shared();
+      if (unlikely(id >= id2loc_.size())) {
+        LOG(ERROR) << "id " << id << " is out of range " << id2loc_.size();
+        crash();
+        return kInvalidID;
+      }
+      uint32_t ret = id2loc_[id];
+      id2loc_resize_mu_.unlock_shared();
+      return ret;
+#endif
+    }
+
+    void set_id2loc(uint32_t id, uint32_t loc) {
+#ifdef NO_MAPPING
+      return;
+#else
+      if (unlikely(id >= id2loc_.size())) {
+        id2loc_resize_mu_.lock();
+        if (likely(id >= id2loc_.size())) {
+          id2loc_.resize(1.5 * id);
+          LOG(INFO) << "Resize id2loc_ to " << id2loc_.size();
+        }
+        id2loc_resize_mu_.unlock();
+      }
+      // Here, we do not grab any locks. But no matter:
+      // Here, the id2loc_.size() must > id (as it only increases).
+      // So, we only need to ensure that no concurrent resize happens (use-after-free).
+      id2loc_resize_mu_.lock_shared();
+      id2loc_[id] = loc;
+      id2loc_resize_mu_.unlock_shared();
+#endif
+    }
+
+    uint64_t id2page(uint32_t id) {
+      uint32_t loc = id2loc(id);
+      if (loc == kInvalidID) {
+        return kInvalidID;
+      }
+      return loc_sector_no(loc);
+    }
+
+    // If nnodes_per_sector >= 1, page_layout[i * nnodes_per_sector + j] is the id of the j-th node in the i-th page.
+    // ElseIf nnodes_per_sector == 0, page_layout[i] is the id of the i-th node (starting from loc_sector_no(i)).
+    std::vector<uint32_t> loc2id_;
+    v2::ReaderOptSharedMutex loc2id_resize_mu_;
+    std::mutex alloc_lock;
+    ConcurrentQueue<uint32_t> empty_pages = ConcurrentQueue<uint32_t>(kInvalidID);
+
+    using PageArr = std::vector<uint32_t>;
+
+    PageArr get_page_layout(uint32_t page_no) {
+      loc2id_resize_mu_.lock_shared();
+      PageArr ret;
+      auto st = sector_to_loc(page_no, 0);
+      auto ed = nnodes_per_sector == 0 ? st + 1 : st + nnodes_per_sector;
+      for (uint32_t i = st; i < ed; ++i) {
+        ret.push_back(loc2id_[i]);
+      }
+      loc2id_resize_mu_.unlock_shared();
+      return ret;
+    }
+
+    uint32_t loc2id(uint32_t loc) {
+      loc2id_resize_mu_.lock_shared();
+      if (unlikely(loc > loc2id_.size())) {
+        LOG(ERROR) << "loc " << loc << " is out of range " << loc2id_.size();
+        crash();
+        return kInvalidID;
+      }
+      uint32_t ret = loc2id_[loc];
+      loc2id_resize_mu_.unlock_shared();
+      return ret;
+    }
+
+    void set_loc2id(uint32_t loc, uint32_t id) {
+      if (unlikely(loc >= loc2id_.size())) {
+        loc2id_resize_mu_.lock();
+        if (likely(loc >= loc2id_.size())) {
+          loc2id_.resize(1.5 * loc);
+          LOG(INFO) << "Resize loc2id_ to " << loc2id_.size();
+        }
+        loc2id_resize_mu_.unlock();
+      }
+      loc2id_resize_mu_.lock_shared();
+      loc2id_[loc] = id;
+      loc2id_resize_mu_.unlock_shared();
+    }
+
+    void erase_loc2id(uint32_t loc) {
+      loc2id_resize_mu_.lock_shared();
+      loc2id_[loc] = kInvalidID;
+      uint32_t st = sector_to_loc(loc_sector_no(loc), 0);
+      bool empty = true;
+      for (uint32_t i = st; i < st + nnodes_per_sector; ++i) {
+        if (loc2id_[i] != kInvalidID) {
+          empty = false;
+          break;
+        }
+      }
+      if (empty) {
+        empty_pages.push(loc_sector_no(loc));
+      }
+      uint32_t page = loc_sector_no(loc);
+      uint32_t offset = loc % nnodes_per_sector;
+      loc2id_resize_mu_.unlock_shared();
+    }
+
+    void erase_and_set_loc(const std::vector<uint64_t> &old_locs, const std::vector<uint64_t> &new_locs,
+                           const std::vector<uint32_t> &new_ids) {
+      std::lock_guard<std::mutex> lock(alloc_lock);
+      for (uint32_t i = 0; i < new_locs.size(); ++i) {
+        set_loc2id(new_locs[i], new_ids[i]);
+      }
+      for (auto &l : old_locs) {
+        erase_loc2id(l);
+      }
+    }
+
+    // returns <loc, need_read>
+    std::vector<uint64_t> alloc_loc(int n, const std::vector<uint64_t> &hint_pages,
+                                    std::set<uint64_t> &page_need_to_read) {
+      std::lock_guard<std::mutex> lock(alloc_lock);
+      std::vector<uint64_t> ret;
+      int cur = 0;
+      // reuse.
+      uint32_t threshold = (nnodes_per_sector + kIndexSizeFactor - 1) / kIndexSizeFactor;
+
+      // 1. use empty pages.
+      uint32_t empty_page = kInvalidID;
+      while ((empty_page = empty_pages.pop()) != kInvalidID) {
+#ifdef NO_POLLUTE_ORIGINAL
+        if (empty_page < loc_sector_no(init_num_pts)) {
+          continue;
+        }
+#endif
+        auto st = sector_to_loc(empty_page, 0);
+        auto ed = nnodes_per_sector == 0 ? st + 1 : st + nnodes_per_sector;
+        for (uint32_t i = st; i < ed; ++i) {
+          if (unlikely(loc2id_[i] != kInvalidID)) {
+            LOG(ERROR) << "Page " << empty_page << " is not empty " << i << " " << loc2id_[i];
+            crash();
+          }
+          loc2id_[i] = kAllocatedID;
+          ret.push_back(i);
+          ++cur;
+          if (cur == n) {
+            return ret;
+          }
+        }
+      }
+
+      // 2. use hint pages.
+      for (auto &p : hint_pages) {
+#ifdef NO_POLLUTE_ORIGINAL
+        if (p < loc_sector_no(init_num_pts)) {
+          continue;
+        }
+#endif
+        // first, see the number of holes.
+        uint32_t cnt = 0;
+        auto st = sector_to_loc(p, 0);
+        auto ed = nnodes_per_sector == 0 ? st + 1 : st + nnodes_per_sector;
+        for (uint32_t i = st; i < ed; ++i) {
+          if (loc2id_[i] == kInvalidID) {
+            cnt++;
+          }
+        }
+        if (cnt < threshold) {
+          continue;
+        }
+        // second, allocate them.
+        if (cnt < nnodes_per_sector) {
+          page_need_to_read.insert(p);
+        }
+        for (uint32_t i = st; i < ed; ++i) {
+          if (loc2id_[i] == kInvalidID) {
+            loc2id_[i] = kAllocatedID;
+            ret.push_back(i);
+            ++cur;
+            if (cur == n) {
+              return ret;
+            }
+          }
+        }
+      }
+
+      // 3. use new pages.
+      int remaining = n - cur;
+      for (int i = 0; i < remaining; i++) {
+        set_loc2id(cur_loc + i, kAllocatedID);  // auto resize.
+        ret.push_back(cur_loc + i);
+      }
+
+      // ensure that cur_loc is aligned.
+      // the hole will eventually be recycled using either empty page queue or hint pages.
+      cur_loc += remaining;
+      while (nnodes_per_sector != 0 && cur_loc % nnodes_per_sector != 0) {
+        set_loc2id(cur_loc++, kInvalidID);  // auto resize.
+      }
+      return ret;
+    }
+
+    void verify_id2loc() {
+      // verify id -> loc -> id map.
+      LOG(INFO) << "ID2loc size: " << id2loc_.size() << ", cur_loc: " << cur_loc.load() << ", cur_id: " << cur_id
+                << ", nnodes_per_sector: " << nnodes_per_sector;
+      for (uint32_t i = 0; i < cur_id; ++i) {
+        auto loc = id2loc(i);
+        if (unlikely(loc >= cur_loc.load())) {
+          LOG(ERROR) << "ID2loc inconsistency at ID: " << i << ", loc: " << loc << ", cur_loc: " << cur_loc.load();
+          crash();
+        }
+        if (unlikely(loc2id(loc) != i)) {
+          LOG(ERROR) << "ID2loc inconsistency at ID: " << i << ", loc: " << id2loc(i)
+                     << ", loc2id: " << loc2id(id2loc(i));
+          crash();
+        }
+      }
+
+      LOG(INFO) << "ID2loc consistency check passed.";
+
+      // verify loc2id do not contain duplicate ids.
+      for (uint32_t i = 0; i < cur_loc; ++i) {
+        auto id = loc2id(i);
+        if (id != kInvalidID && id != kAllocatedID) {
+          uint32_t loc = id2loc(id);
+          if (unlikely(loc != i)) {
+            LOG(ERROR) << "loc2id inconsistency at loc: " << i << ", id: " << id << ", loc: " << loc;
+          }
+        }
+      }
+      LOG(INFO) << "loc2ID consistency check passed.";
+    }
+    std::atomic<uint64_t> cur_id, cur_loc;
+
+    // merge deletes (NOTE: index read-only during merge.)
+    void merge_deletes(const std::string &in_path_prefix, const std::string &out_path_prefix,
+                       const std::vector<TagT> &deleted_nodes, const tsl::robin_set<TagT> &deleted_nodes_set,
+                       uint32_t nthreads, const uint32_t &n_sampled_nbrs);
+
+    void write_metadata_and_pq(const std::string &in_path_prefix, const std::string &out_path_prefix,
+                               const uint64_t &new_npoints, const uint64_t &new_medoid,
+                               std::vector<TagT> *new_tags = nullptr);
+    void copy_index(const std::string &prefix_in, const std::string &prefix_out);
+
+   private:
+    // Are we dealing with normalized data? This will be true
+    // if distance == COSINE and datatype == float. Required
+    // because going forward, we will normalize vectors when
+    // asked to search with COSINE similarity. Of course, this
+    // will be done only for floating point vectors.
+    bool data_is_normalized = false;
+
+    // medoid/start info
+    uint32_t medoid = 0;  // 1 entry point.
+
+    // thread-specific scratch
+    ConcurrentQueue<QueryBuffer<T> *> thread_data_queue;
+    std::vector<QueryBuffer<T> *> thread_data_bufs;  // pre-allocated thread data
+    uint64_t max_nthreads;
+
+    bool load_flag = false;    // already loaded.
+    bool enable_tags = false;  // support for tags and dynamic indexing
+  };
+}  // namespace pipeann

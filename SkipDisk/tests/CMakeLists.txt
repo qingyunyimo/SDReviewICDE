@@ -1,0 +1,33 @@
+set(CMAKE_CXX_STANDARD 17)
+add_executable(encode_rabitq_pivot encode_rabitq_pivot.cpp)
+target_link_libraries(encode_rabitq_pivot ${PROJECT_NAME})
+
+add_executable(search_pcamixed_disk_index search_pcamixed_disk_index.cpp)
+target_link_libraries(search_pcamixed_disk_index ${PROJECT_NAME})
+
+add_executable(test_mixed_pivot test_mixed_pivot.cpp)
+target_link_libraries(test_mixed_pivot ${PROJECT_NAME})
+
+add_executable(search_pcanavi_disk_index search_pcanavi_disk_index.cpp)
+target_link_libraries(search_pcanavi_disk_index ${PROJECT_NAME})
+
+add_executable(search_pcabitnavi_disk_index search_pcabitnavi_disk_index.cpp)
+target_link_libraries(search_pcabitnavi_disk_index ${PROJECT_NAME})
+
+add_executable(search_pcabitpqnavi_disk_index search_pcabitpqnavi_disk_index.cpp)
+target_link_libraries(search_pcabitpqnavi_disk_index ${PROJECT_NAME})
+
+add_executable(search_pcabitsubpqnavi_disk_index search_pcabitsubpqnavi_disk_index.cpp)
+target_link_libraries(search_pcabitsubpqnavi_disk_index ${PROJECT_NAME})
+
+add_executable(search_pcabitsubpqnavi_cache_disk_index search_pcabitsubpqnavi_cache_disk_index.cpp)
+target_link_libraries(search_pcabitsubpqnavi_cache_disk_index ${PROJECT_NAME})
+
+add_executable(search_pcabitsubpqestnavi_disk_index search_pcabitsubpqestnavi_disk_index.cpp)
+target_link_libraries(search_pcabitsubpqestnavi_disk_index ${PROJECT_NAME})
+
+add_executable(search_pcasubpqnavi_disk_index search_pcasubpqnavi_disk_index.cpp)
+target_link_libraries(search_pcasubpqnavi_disk_index ${PROJECT_NAME})
+
+add_executable(search_pcabitsubpqestnavi_cache_disk_index search_pcabitsubpqestnavi_cache_disk_index.cpp)
+target_link_libraries(search_pcabitsubpqestnavi_cache_disk_index ${PROJECT_NAME})
