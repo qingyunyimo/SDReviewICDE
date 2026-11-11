@@ -18,10 +18,12 @@ Use Linux on an x86-64 CPU with AVX2 or AVX-512, GCC 11 or newer, CMake 3.15
 or newer, and Python 3.10 or newer. Build on the machine that will run the code
 because compilation uses `-march=native`.
 
-On Ubuntu, install dependencies:
+From the repository root, install the Ubuntu build and Python dependencies:
 
 ```bash
-sudo apt-get install build-essential cmake libaio-dev libgoogle-perftools-dev libeigen3-dev libopenblas-dev
+sudo apt-get update
+sudo apt-get install build-essential cmake python3 python3-venv python3-pip \
+  libaio-dev libgoogle-perftools-dev libeigen3-dev libopenblas-dev
 python3 -m venv /tmp/sdreviewicde-venv
 source /tmp/sdreviewicde-venv/bin/activate
 python3 -m pip install -r requirements.txt
@@ -40,7 +42,24 @@ reported by the final test messages and a zero exit status.
 
 The quick start uses Linux AIO to work on systems that restrict io_uring.
 It is a correctness demonstration, not a reproduction of paper latency numbers.
-The bundled liburing backend remains available for performance experiments.
+
+For the optional io_uring backend, also install `liburing-dev` and use a
+separate build directory:
+
+```bash
+sudo apt-get install liburing-dev
+cmake -S SkipDisk -B /tmp/sdreviewicde-uring-build \
+  -DCMAKE_BUILD_TYPE=Release -DUSE_AIO=OFF -DBLA_VENDOR=OpenBLAS
+cmake --build /tmp/sdreviewicde-uring-build \
+  --target search_pcamixed_disk_index test_mixed_pivot --parallel 2
+bash scripts/smoke_test.sh /tmp/sdreviewicde-uring-build
+```
+
+Keep the Python virtual environment activated for these tests. CMake uses the
+installed liburing headers and library; it does not automatically use the
+bundled headers. Running this backend requires kernel and runtime permissions
+that allow io_uring. See [build details](docs/BUILD.md) for using a separately
+built liburing and for optional DiskANN dependencies.
 
 ## Source map
 
