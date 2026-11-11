@@ -1,5 +1,12 @@
 # SkipDisk — ICDE Review Code
 
+> **Review artifact.** This repository contains the research implementation
+> accompanying our ICDE submission. It includes source code and small synthetic
+> correctness tests; datasets and full experimental results are not included.
+> The code has been validated in the environment documented in
+> [docs/VALIDATION.md](docs/VALIDATION.md), but has not been extensively tested
+> across platforms and is not intended for production use.
+
 SkipDisk is an out-of-core approximate nearest-neighbor search implementation.
 This source-only package contains the search engine, index preparation tools,
 and small synthetic correctness tests. No datasets, pretrained indexes,
